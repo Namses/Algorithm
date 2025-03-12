@@ -1,1 +1,266 @@
+import scanpy as sc
+import os
+import openai
+import matplotlib.pyplot as plt
+import numpy as np  
 
+class SingleCellscanpy:
+
+    def __init__(self, data_path):
+
+        self.data_path = data_path
+        self.adata = None
+
+    def analyze(self):
+
+        self.__load_data()
+        self.__calculate_qc_metrics()
+        self.__filter_data()
+        self.__gene_variability()
+        self.__normalize_data()
+        self.__pca()
+        self.__umap()
+        self.__clustering()
+        self.__gene_ranking()
+        self.__pseudotime_analysis()
+        self.llm_annotation(api_key="your_openai_api_key")
+
+    def __load_data(self):
+        
+        self.adata = sc.read_10x_h5(self.data_path)
+        self.adata.var_names_make_unique()
+
+    def __calculate_qc_metrics(self):
+        
+        self.adata.var["mt"] = self.adata.var_names.str.startswith("mt-")
+        sc.pp.calculate_qc_metrics(self.adata, qc_vars=["mt"], percent_top=None, inplace=True)
+    
+        sc.pl.violin(
+        self.adata,
+        ["n_genes_by_counts", "total_counts", "pct_counts_mt"],
+        jitter=0.4,
+        multi_panel=True,)
+
+        sc.pl.scatter(self.adata, "total_counts", "n_genes_by_counts", color="pct_counts_mt")
+        print("QC metrics successfully calculated.")
+
+    def __filter_data(self):
+    
+        self.adata.obs["outlier_n_genes"] = self.adata.obs.n_genes_by_counts > 5000  
+        self.adata.obs["outlier_total"] = self.adata.obs.total_counts > 2500  
+        self.adata.obs["outlier_mt"] = self.adata.obs.pct_counts_mt > 20  
+    
+        print("%u cells with large number of genes." % sum(self.adata.obs["outlier_n_genes"]))
+        print("%u cells with large total counts." % sum(self.adata.obs["outlier_total"]))
+        print("%u cells with high %% of mitochondrial genes"% sum(self.adata.obs["outlier_mt"]))
+        
+        sc.pp.filter_genes(self.adata, min_cells=3)
+    
+    def __gene_variability(self):
+        
+        sc.experimental.pp.highly_variable_genes(
+        self.adata, flavor="pearson_residuals", n_top_genes=2000
+        )
+        print("Highly variable genes process completed successfully")
+
+
+        fig, ax= plt.subplots(figsize=(6, 6))
+
+        hvgs = self.adata.var["highly_variable"]
+
+        ax.scatter(
+        self.adata.var["mean_counts"], self.adata.var["residual_variances"], s=3, edgecolor="none"
+        )
+        
+        ax.scatter(
+        self.adata.var["mean_counts"][hvgs],
+        self.adata.var["residual_variances"][hvgs],
+        c="tab:red",
+        label="selected genes",
+        s=10,
+        edgecolor="none",
+        )
+        
+        marker = []
+        if marker is not None:
+           ax.scatter(
+           self.adata.var["mean_counts"][np.isin(self.adata.var_names, marker)],
+           self.adata.var["residual_variances"][np.isin(self.adata.var_names, marker)],
+           c="k",
+           label="known marker genes",
+           s=10,
+           edgecolor="none",
+           )
+
+        ax.set_xscale("log")
+        ax.set_xlabel("mean expression")
+        ax.set_yscale("log")
+        ax.set_ylabel("residual variance")
+        ax.set_title(self.adata.uns.get("name", "Gene Variability Plot"))
+
+        ax.spines["right"].set_visible(False)
+        ax.spines["top"].set_visible(False)
+        ax.yaxis.set_ticks_position("left")
+        ax.xaxis.set_ticks_position("bottom")
+        plt.legend()
+        plt.show()
+        print("Gene variability plot process completed successfully")
+
+    def __normalize_data(self):
+
+        sc.pp.normalize_total(self.adata, target_sum=1e4)
+        print("Normalization process completed successfully")
+
+        sc.pp.log1p(self.adata)
+        print("Log transformation process completed successfully") 
+
+    def __pca(self):  
+
+        sc.pp.neighbors(self.adata)
+        sc.tl.leiden(self.adata, resolution=2.4)
+        sc.tl.pca(self.adata, n_comps=50)
+        sc.pl.pca(self.adata, color="leiden", show=True, title="PCA")
+        print("PCA process completed successfully")
+
+    def __umap(self):
+
+        sc.pp.neighbors(self.adata, n_neighbors=30, n_pcs=50)  
+        sc.tl.umap(self.adata)
+        sc.pl.umap(self.adata, color='leiden', show=True, title="UMAP")
+        print("UMAP process completed successfully")
+
+    def __clustering(self):
+    
+        sc.tl.leiden(self.adata, resolution=1.5)
+        
+        cluster_ids = self.adata.obs['leiden'].unique()
+        cluster_gene_info = {}
+    
+        for cluster_id in cluster_ids:
+            cluster_cells = self.adata[self.adata.obs['leiden'] == cluster_id, :]
+            
+            gene_sums = cluster_cells.X.sum(axis=0).A1  
+            
+            top_gene_indices = gene_sums.argsort()[-30:][::-1]
+            
+            top_genes = self.adata.var_names[top_gene_indices]
+            
+            cluster_gene_info[cluster_id] = top_genes.tolist()
+        cluster_gene_matrix = np.array(list(cluster_gene_info.values()))
+        
+        print("Top 30 genes for each cluster (30x30 matrix):")
+        for row in cluster_gene_matrix:
+            print(" | ".join(row))    
+        representative_genes = {cluster_id: genes[0] for cluster_id, genes in cluster_gene_info.items()}
+        self.adata.obs['representative_gene'] = self.adata.obs['leiden'].map(representative_genes)
+
+        sc.pl.umap(
+            self.adata,
+            color='representative_gene',  
+            legend_loc='on data',
+            title="UMAP with Representative Genes Of Cluster",
+            show=True
+        )
+        print("Clustering process completed successfully")
+
+        sc.pl.umap(
+            self.adata,
+            color='representative_gene',  
+            legend_loc='on data',
+            title="UMAP with Representative Genes Of Cluster",
+            show=True
+        )
+        print("Clustering process completed successfully")
+
+    def __gene_ranking(self):
+
+        sc.tl.rank_genes_groups(self.adata, 'leiden', method='t-test')
+        sc.pl.rank_genes_groups(self.adata, sharey=False)
+        print("Gene ranking process completed successfully.")
+        
+    def __pseudotime_analysis(self):
+       
+       root_cell_index = 0
+       self.adata.uns['iroot'] = root_cell_index
+
+       sc.tl.paga(self.adata)
+
+       num_clusters = self.adata.obs['leiden'].nunique()
+       print(f"Number of unique clusters: {num_clusters}")
+
+       sc.pl.paga(self.adata, plot=True)
+
+       print("Pseudotime analysis completed successfully.")
+
+    def llm_annotation(self, api_key):
+        
+        openai.api_key = api_key
+         
+        if 'rank_genes_groups' not in self.adata.uns:
+            print("Error: 'rank_genes_groups' data not found. Please check clustering and gene ranking.")
+            return
+        
+        top_genes = self.adata.uns['rank_genes_groups']['names']
+        if isinstance(top_genes, np.ndarray):
+           if top_genes.dtype.kind != 'U':
+               top_genes = top_genes.reshape(-1, 1)  
+           elif top_genes.ndim != 2:  
+                print("Error: Unexpected format in 'rank_genes_groups' 'names'.")
+                return
+        else:
+            print("Error: 'rank_genes_groups' 'names' data is not an array.")
+            return 
+            
+        clusters = self.adata.obs['leiden'].unique()
+        prompt = "The following are the top marker genes for each cluster in a single-cell RNA sequencing analysis:\n\n"
+        for i, cluster in enumerate(clusters):
+            if i < top_genes.shape[0]:
+               genes = ', '.join(map(str, top_genes[i]))
+               prompt += f"Cluster {cluster}: {genes}\n"
+
+        prompt += (
+        "\nBased on the marker genes provided above, assign each cluster a likely cell type or biological state "
+        "and provide a brief explanation for each."
+        )
+
+        interpretation = None
+        try:
+            response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What can you do for me?"}
+            ]
+            )
+            print(response['choices'][0]['message']['content'])
+
+            output_dir = r"C:/Users/hankyu.namgoong/OneDrive - Telechips/Desktop/Han/Scanpy cancer results"
+            if not os.path.exists(output_dir):
+               os.makedirs(output_dir)
+
+            filepath = os.path.join(output_dir, "llm_annotation.txt")
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(interpretation)
+                print(f"LLM Annotation saved at {filepath}")
+
+        except Exception as e:
+            print("Error while communicating with LLM:", e)
+
+        output_dir = r"C:/Users/hankyu.namgoong/OneDrive - Telechips/Desktop/Han/Scanpy cancer results"
+
+        if interpretation:
+            output_dir = r"C:/Users/hankyu.namgoong/OneDrive - Telechips/Desktop/Han/Scanpy cancer results"
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+
+            filepath = os.path.join(output_dir, "llm_annotation.txt")
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(interpretation)
+                print(f"LLM Annotation saved at {filepath}")
+        else:
+            print("No LLM interpretation available to save.")
+
+if __name__ == "__main__":
+   os.environ["openai.api_key"] = "your-api-key-here"
+   analysis = SingleCellscanpy(data_path='C:/GSM4819725/cancer1/GSM4819725_SI_18854_filtered_gene_bc_matrices_h5.h5')
+   analysis.analyze()
